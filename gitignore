@@ -1,0 +1,5 @@
+build/
+*.dll
+*.o
+*.obj
+*.pdb
