@@ -16,24 +16,51 @@ static void log_write(const char* m) { if (!g_log) return; fprintf(g_log, "%s\n"
 static void log_close() { if (!g_log) return; fprintf(g_log, "proxy unloaded\n"); fflush(g_log); fclose(g_log); g_log = nullptr; }
 
 static HMODULE real_d3d9 = nullptr;
-static IDirect3D9* (WINAPI* real_Create9)(UINT) = nullptr;
+static IDirect3D9* (WINAPI* real_Create9)(UINT)                    = nullptr;
+static HRESULT     (WINAPI* real_Create9Ex)(UINT, IDirect3D9Ex**)  = nullptr;
 
 #define D3DFMT_INTZ ((D3DFORMAT)MAKEFOURCC('I','N','T','Z'))
 #define D3DFMT_DF24 ((D3DFORMAT)MAKEFOURCC('D','F','2','4'))
 #define D3DFMT_DF16 ((D3DFORMAT)MAKEFOURCC('D','F','1','6'))
 
-struct D3D9DeviceProxy : IDirect3DDevice9 {
-    IDirect3DDevice9* real;
+static bool load_real_d3d9() {
+    if (real_d3d9) return true;
+    real_d3d9 = LoadLibraryA("d3d9_dxvk.dll");
+    if (!real_d3d9) {
+        char sys[MAX_PATH];
+        GetSystemDirectoryA(sys, MAX_PATH);
+        strcat(sys, "\\d3d9.dll");
+        real_d3d9 = LoadLibraryA(sys);
+    }
+    if (!real_d3d9) { log_write("ERROR: cannot load real d3d9"); return false; }
+    log_write("real d3d9 loaded");
+    real_Create9   = (IDirect3D9*(WINAPI*)(UINT))             GetProcAddress(real_d3d9, "Direct3DCreate9");
+    real_Create9Ex = (HRESULT(WINAPI*)(UINT, IDirect3D9Ex**)) GetProcAddress(real_d3d9, "Direct3DCreate9Ex");
+    return true;
+}
+
+// D3D9DeviceProxy реализует IDirect3DDevice9Ex.
+// real_ex — не-владеющий алиас на тот же COM-объект через Ex-интерфейс (может быть null).
+struct D3D9DeviceProxy : IDirect3DDevice9Ex {
+    IDirect3DDevice9*   real;
+    IDirect3DDevice9Ex* real_ex;
     UINT sw = 1920, sh = 1080;
-    IDirect3DSurface9* depth_surface = nullptr;
+    IDirect3DSurface9*  depth_surface = nullptr;
     UINT depth_w = 0, depth_h = 0;
-    IDirect3DTexture9* depth_tex = nullptr;
-    IDirect3DSurface9* depth_srf = nullptr;
-    bool depth_ready = false;
+    IDirect3DTexture9*  depth_tex     = nullptr;
+    IDirect3DSurface9*  depth_srf     = nullptr;
+    bool depth_ready    = false;
     bool depth_captured = false;
     D3DFORMAT last_rt_fmt = D3DFMT_UNKNOWN;
 
-    D3D9DeviceProxy(IDirect3DDevice9* r) : real(r) {}
+    explicit D3D9DeviceProxy(IDirect3DDevice9* r) : real(r), real_ex(nullptr) {
+        IDirect3DDevice9Ex* tmp = nullptr;
+        if (SUCCEEDED(r->QueryInterface(IID_IDirect3DDevice9Ex, (void**)&tmp))) {
+            tmp->Release();
+            real_ex = tmp;
+            log_write("Device9Ex available");
+        }
+    }
     ~D3D9DeviceProxy() { cleanup(); }
 
     void cleanup() {
@@ -89,10 +116,31 @@ struct D3D9DeviceProxy : IDirect3DDevice9 {
         }
     }
 
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID r, void** p) override { return real->QueryInterface(r, p); }
-    ULONG   STDMETHODCALLTYPE AddRef()  override { return real->AddRef(); }
-    ULONG   STDMETHODCALLTYPE Release() override { ULONG r = real->Release(); if (!r) delete this; return r; }
-    HRESULT STDMETHODCALLTYPE TestCooperativeLevel() override { return real->TestCooperativeLevel(); }
+    // --- IUnknown ---
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID r, void** p) override {
+        if (!p) return E_POINTER;
+        if (r == IID_IUnknown || r == IID_IDirect3DDevice9) {
+            *p = static_cast<IDirect3DDevice9*>(this); AddRef(); return S_OK;
+        }
+        if (r == IID_IDirect3DDevice9Ex) {
+            if (!real_ex) return E_NOINTERFACE;
+            *p = static_cast<IDirect3DDevice9Ex*>(this); AddRef(); return S_OK;
+        }
+        return real->QueryInterface(r, p);
+    }
+    ULONG STDMETHODCALLTYPE AddRef()  override { return real->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = real->Release();
+        if (!r) { real_ex = nullptr; delete this; }
+        return r;
+    }
+
+    // --- IDirect3DDevice9 ---
+    HRESULT STDMETHODCALLTYPE TestCooperativeLevel() override {
+        HRESULT hr = real->TestCooperativeLevel();
+        if (hr == D3DERR_DEVICELOST) cleanup();
+        return hr;
+    }
     UINT    STDMETHODCALLTYPE GetAvailableTextureMem() override { return real->GetAvailableTextureMem(); }
     HRESULT STDMETHODCALLTYPE EvictManagedResources() override { return real->EvictManagedResources(); }
     HRESULT STDMETHODCALLTYPE GetDirect3D(IDirect3D9** p) override { return real->GetDirect3D(p); }
@@ -111,9 +159,7 @@ struct D3D9DeviceProxy : IDirect3DDevice9 {
         if (SUCCEEDED(hr) && p) { sw = p->BackBufferWidth ? p->BackBufferWidth : sw; sh = p->BackBufferHeight ? p->BackBufferHeight : sh; }
         return hr;
     }
-    HRESULT STDMETHODCALLTYPE Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) override {
-        return real->Present(a, b, c, d);
-    }
+    HRESULT STDMETHODCALLTYPE Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) override { return real->Present(a, b, c, d); }
     HRESULT STDMETHODCALLTYPE GetBackBuffer(UINT a, UINT b, D3DBACKBUFFER_TYPE c, IDirect3DSurface9** d) override { return real->GetBackBuffer(a, b, c, d); }
     HRESULT STDMETHODCALLTYPE GetRasterStatus(UINT a, D3DRASTER_STATUS* b) override { return real->GetRasterStatus(a, b); }
     HRESULT STDMETHODCALLTYPE SetDialogBoxMode(BOOL b) override { return real->SetDialogBoxMode(b); }
@@ -234,15 +280,104 @@ struct D3D9DeviceProxy : IDirect3DDevice9 {
     HRESULT STDMETHODCALLTYPE DrawTriPatch(UINT h, const float* s, const D3DTRIPATCH_INFO* i) override { return real->DrawTriPatch(h,s,i); }
     HRESULT STDMETHODCALLTYPE DeletePatch(UINT h) override { return real->DeletePatch(h); }
     HRESULT STDMETHODCALLTYPE CreateQuery(D3DQUERYTYPE t, IDirect3DQuery9** q) override { return real->CreateQuery(t,q); }
+
+    // --- IDirect3DDevice9Ex ---
+    HRESULT STDMETHODCALLTYPE SetConvolutionMonoKernel(UINT w, UINT h, float* rows, float* cols) override {
+        return real_ex ? real_ex->SetConvolutionMonoKernel(w, h, rows, cols) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE ComposeRects(IDirect3DSurface9* pSrc, IDirect3DSurface9* pDst,
+        IDirect3DVertexBuffer9* pSrcRects, UINT nRects, IDirect3DVertexBuffer9* pDstRects,
+        D3DCOMPOSERECTSOP op, int xOff, int yOff) override {
+        return real_ex ? real_ex->ComposeRects(pSrc, pDst, pSrcRects, nRects, pDstRects, op, xOff, yOff) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE PresentEx(const RECT* pSrc, const RECT* pDst, HWND hWnd,
+        const RGNDATA* pDirty, DWORD flags) override {
+        return real_ex ? real_ex->PresentEx(pSrc, pDst, hWnd, pDirty, flags) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT* p) override {
+        return real_ex ? real_ex->GetGPUThreadPriority(p) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE SetGPUThreadPriority(INT p) override {
+        return real_ex ? real_ex->SetGPUThreadPriority(p) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE WaitForVBlank(UINT i) override {
+        return real_ex ? real_ex->WaitForVBlank(i) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE CheckResourceResidency(IDirect3DResource9** arr, UINT32 n) override {
+        return real_ex ? real_ex->CheckResourceResidency(arr, n) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT n) override {
+        return real_ex ? real_ex->SetMaximumFrameLatency(n) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* n) override {
+        return real_ex ? real_ex->GetMaximumFrameLatency(n) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND h) override {
+        return real_ex ? real_ex->CheckDeviceState(h) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE CreateRenderTargetEx(UINT w, UINT h, D3DFORMAT f,
+        D3DMULTISAMPLE_TYPE ms, DWORD q, BOOL l, IDirect3DSurface9** s, HANDLE* sh, DWORD u) override {
+        return real_ex ? real_ex->CreateRenderTargetEx(w, h, f, ms, q, l, s, sh, u) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE CreateOffscreenPlainSurfaceEx(UINT w, UINT h, D3DFORMAT f,
+        D3DPOOL p, IDirect3DSurface9** s, HANDLE* sh, DWORD u) override {
+        return real_ex ? real_ex->CreateOffscreenPlainSurfaceEx(w, h, f, p, s, sh, u) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE CreateDepthStencilSurfaceEx(UINT w, UINT h, D3DFORMAT f,
+        D3DMULTISAMPLE_TYPE ms, DWORD q, BOOL d, IDirect3DSurface9** s, HANDLE* sh, DWORD u) override {
+        HRESULT hr = real_ex ? real_ex->CreateDepthStencilSurfaceEx(w, h, f, ms, q, d, s, sh, u) : E_NOINTERFACE;
+        if (SUCCEEDED(hr) && s && *s && w > 256 && h > 256 && !depth_ready)
+            { depth_w = w; depth_h = h; init_depth_resources(w, h); }
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* pp, D3DDISPLAYMODEEX* dm) override {
+        log_write("ResetEx"); cleanup();
+        if (!real_ex) return E_NOINTERFACE;
+        HRESULT hr = real_ex->ResetEx(pp, dm);
+        if (SUCCEEDED(hr) && pp) {
+            sw = pp->BackBufferWidth  ? pp->BackBufferWidth  : sw;
+            sh = pp->BackBufferHeight ? pp->BackBufferHeight : sh;
+        }
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplayModeEx(UINT i, D3DDISPLAYMODEEX* m, D3DDISPLAYROTATION* r) override {
+        return real_ex ? real_ex->GetDisplayModeEx(i, m, r) : E_NOINTERFACE;
+    }
 };
-struct D3D9Proxy : IDirect3D9 {
-    IDirect3D9* real;
-    D3D9Proxy(IDirect3D9* r) : real(r) { log_write("D3D9 created"); }
+
+// D3D9Proxy реализует IDirect3D9Ex.
+// real_ex — не-владеющий алиас (может быть null если бэкенд не поддерживает Ex).
+struct D3D9Proxy : IDirect3D9Ex {
+    IDirect3D9*   real;
+    IDirect3D9Ex* real_ex;
+
+    explicit D3D9Proxy(IDirect3D9* r) : real(r), real_ex(nullptr) {
+        IDirect3D9Ex* tmp = nullptr;
+        if (SUCCEEDED(r->QueryInterface(IID_IDirect3D9Ex, (void**)&tmp))) {
+            tmp->Release();
+            real_ex = tmp;
+        }
+        log_write("D3D9 created");
+    }
     ~D3D9Proxy() { log_write("D3D9 destroyed"); }
 
-    HRESULT  STDMETHODCALLTYPE QueryInterface(REFIID r, void** p) override { return real->QueryInterface(r,p); }
+    HRESULT  STDMETHODCALLTYPE QueryInterface(REFIID r, void** p) override {
+        if (!p) return E_POINTER;
+        if (r == IID_IUnknown || r == IID_IDirect3D9) {
+            *p = static_cast<IDirect3D9*>(this); AddRef(); return S_OK;
+        }
+        if (r == IID_IDirect3D9Ex) {
+            if (!real_ex) return E_NOINTERFACE;
+            *p = static_cast<IDirect3D9Ex*>(this); AddRef(); return S_OK;
+        }
+        return real->QueryInterface(r, p);
+    }
     ULONG    STDMETHODCALLTYPE AddRef()  override { return real->AddRef(); }
-    ULONG    STDMETHODCALLTYPE Release() override { ULONG r=real->Release(); if(!r) delete this; return r; }
+    ULONG    STDMETHODCALLTYPE Release() override {
+        ULONG r = real->Release();
+        if (!r) { real_ex = nullptr; delete this; }
+        return r;
+    }
     HRESULT  STDMETHODCALLTYPE RegisterSoftwareDevice(void* p) override { return real->RegisterSoftwareDevice(p); }
     UINT     STDMETHODCALLTYPE GetAdapterCount() override { return real->GetAdapterCount(); }
     HRESULT  STDMETHODCALLTYPE GetAdapterIdentifier(UINT a, DWORD b, D3DADAPTER_IDENTIFIER9* c) override { return real->GetAdapterIdentifier(a,b,c); }
@@ -286,6 +421,41 @@ struct D3D9Proxy : IDirect3D9 {
         }
         return hr;
     }
+
+    // --- IDirect3D9Ex ---
+    UINT STDMETHODCALLTYPE GetAdapterModeCountEx(UINT a, const D3DDISPLAYMODEFILTER* f) override {
+        return real_ex ? real_ex->GetAdapterModeCountEx(a, f) : 0;
+    }
+    HRESULT STDMETHODCALLTYPE EnumAdapterModesEx(UINT a, const D3DDISPLAYMODEFILTER* f, UINT m, D3DDISPLAYMODEEX* mode) override {
+        return real_ex ? real_ex->EnumAdapterModesEx(a, f, m, mode) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE GetAdapterDisplayModeEx(UINT a, D3DDISPLAYMODEEX* m, D3DDISPLAYROTATION* r) override {
+        return real_ex ? real_ex->GetAdapterDisplayModeEx(a, m, r) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE CreateDeviceEx(UINT a, D3DDEVTYPE t, HWND w, DWORD f,
+        D3DPRESENT_PARAMETERS* pp, D3DDISPLAYMODEEX* dm, IDirect3DDevice9Ex** d) override {
+        log_write("CreateDeviceEx");
+        if (!real_ex) { log_write("CreateDeviceEx: Ex not available"); return E_NOINTERFACE; }
+        HRESULT hr = real_ex->CreateDeviceEx(a, t, w, f, pp, dm, d);
+        if (SUCCEEDED(hr) && d && *d) {
+            auto* px = new D3D9DeviceProxy(*d);
+            if (pp) {
+                px->sw = pp->BackBufferWidth  ? pp->BackBufferWidth  : 1920;
+                px->sh = pp->BackBufferHeight ? pp->BackBufferHeight : 1080;
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Screen: %ux%u", px->sw, px->sh);
+                log_write(buf);
+            }
+            *d = static_cast<IDirect3DDevice9Ex*>(px);
+            log_write("DeviceEx hooks installed");
+        } else {
+            log_write("CreateDeviceEx FAILED");
+        }
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetAdapterLUID(UINT a, LUID* l) override {
+        return real_ex ? real_ex->GetAdapterLUID(a, l) : E_NOINTERFACE;
+    }
 };
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
@@ -296,20 +466,23 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
 
 extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
     log_write("Direct3DCreate9");
-    if (!real_d3d9) {
-        real_d3d9 = LoadLibraryA("d3d9_dxvk.dll");
-        if (!real_d3d9) {
-            char sys[MAX_PATH];
-            GetSystemDirectoryA(sys, MAX_PATH);
-            strcat(sys, "\\d3d9.dll");
-            real_d3d9 = LoadLibraryA(sys);
-        }
-        if (!real_d3d9) { log_write("ERROR: cannot load real d3d9"); return nullptr; }
-        log_write("real d3d9 loaded");
-        real_Create9 = (IDirect3D9*(WINAPI*)(UINT))GetProcAddress(real_d3d9, "Direct3DCreate9");
-        if (!real_Create9) { log_write("ERROR: Direct3DCreate9 not found"); return nullptr; }
-    }
+    if (!load_real_d3d9()) return nullptr;
+    if (!real_Create9) { log_write("ERROR: Direct3DCreate9 not found"); return nullptr; }
     IDirect3D9* r = real_Create9(sdk);
     if (!r) { log_write("ERROR: null IDirect3D9"); return nullptr; }
     return new D3D9Proxy(r);
+}
+
+extern "C" HRESULT WINAPI Direct3DCreate9Ex(UINT sdk, IDirect3D9Ex** ppD3D) {
+    log_write("Direct3DCreate9Ex");
+    if (!ppD3D) return D3DERR_INVALIDCALL;
+    if (!load_real_d3d9()) return D3DERR_NOTAVAILABLE;
+    if (!real_Create9Ex) { log_write("ERROR: Direct3DCreate9Ex not found"); return D3DERR_NOTAVAILABLE; }
+    IDirect3D9Ex* r = nullptr;
+    HRESULT hr = real_Create9Ex(sdk, &r);
+    if (FAILED(hr) || !r) { log_write("ERROR: Direct3DCreate9Ex failed"); return hr; }
+    auto* proxy = new D3D9Proxy(r);
+    *ppD3D = static_cast<IDirect3D9Ex*>(proxy);
+    log_write("D3D9Ex proxy created");
+    return S_OK;
 }
