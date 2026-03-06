@@ -26,11 +26,6 @@ Two proxy classes are implemented:
 
 ## Backend Loading
 
-When `Direct3DCreate9` is called:
-
-1. Attempts to load `d3d9_dxvk.dll` (Wine + DXVK)
-2. Falls back to system `d3d9.dll`
-
 This allows one build to work on:
 
 - Native Windows
