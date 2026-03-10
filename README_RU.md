@@ -1,4 +1,4 @@
-[🇬🇧 English version](README.md)
+[English version](README.md)
 
 # D3D9 Depth Proxy
 
